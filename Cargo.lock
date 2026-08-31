@@ -357,9 +357,9 @@ dependencies = [
 
 [[package]]
 name = "okhsl"
-version = "1.0.1"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "352b29540625e01082ef383e7964d14c70159527f54bce0afb387ac17bd6ce4e"
+checksum = "6ea70d075ef81a1bbb2dd2c31d87c88282459613a890388cbf8ee2c722c493a9"
 dependencies = [
  "oklab",
  "rgb",
