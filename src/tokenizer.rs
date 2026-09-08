@@ -6,7 +6,7 @@ use winnow::combinator::{alt, delimited, dispatch, eof, fail, opt, peek, termina
 use winnow::error::ContextError;
 use winnow::error::ParserError;
 use winnow::prelude::*;
-use winnow::token::{any, one_of, rest, take, take_until, take_while};
+use winnow::token::{any, one_of, rest, take_until, take_while};
 
 use crate::{Dialect, FormatOptions};
 
@@ -92,6 +92,8 @@ pub(crate) enum TokenKind {
     Number,
     Placeholder,
     Word,
+    Function,
+    Unterminated,
     Join,
 }
 
@@ -191,20 +193,46 @@ fn get_whitespace_token<'i>(input: &mut &'i str) -> Result<Token<'i>> {
 }
 
 fn get_comment_token<'i>(input: &mut &'i str) -> Result<Token<'i>> {
+    if input.starts_with("/*") {
+        let source = *input;
+        let mut depth = 1usize;
+        let mut end = 2;
+        while end < source.len() && depth != 0 {
+            if source[end..].starts_with("/*") {
+                depth += 1;
+                end += 2;
+            } else if source[end..].starts_with("*/") {
+                depth -= 1;
+                end += 2;
+            } else {
+                end += source[end..].chars().next().unwrap().len_utf8();
+            }
+        }
+        let value = input.next_slice(end);
+        return Ok(Token {
+            kind: if depth == 0 {
+                TokenKind::BlockComment
+            } else {
+                TokenKind::Unterminated
+            },
+            value,
+            key: None,
+            alias: value,
+        });
+    }
     dispatch! {any;
         '#' => till_line_ending.value(TokenKind::LineComment),
         '-' => ('-', till_line_ending).value(TokenKind::LineComment),
-        '/' => ('*', alt((take_until(0.., "*/"), rest)), opt(take(2usize))).value(TokenKind::BlockComment),
         _ => fail,
     }
-        .with_taken()
-        .parse_next(input)
-        .map(|(kind, token)| Token {
-            kind,
-            value: token,
-            key: None,
-            alias: token,
-        })
+    .with_taken()
+    .parse_next(input)
+    .map(|(kind, token)| Token {
+        kind,
+        value: token,
+        key: None,
+        alias: token,
+    })
 }
 
 pub fn take_till_escaping<'a>(
@@ -245,13 +273,40 @@ pub fn take_till_escaping<'a>(
 // 5. national character quoted string using N'' or N\' to escape
 // 6. hex(blob literal) does not need to escape
 fn get_string_token<'i>(input: &mut &'i str, dialect: Dialect) -> Result<Token<'i>> {
-    dispatch! {any;
+    let source = *input;
+    if dialect != Dialect::SQLServer && input.starts_with('$') {
+        let source = *input;
+        if let Some(tag_end) = source[1..].find('$').map(|end| end + 1) {
+            let tag = &source[1..tag_end];
+            let valid_tag = tag.is_empty()
+                || tag.chars().enumerate().all(|(index, c)| {
+                    c == '_' || c.is_alphabetic() || (index > 0 && c.is_alphanumeric())
+                });
+            if valid_tag {
+                let delimiter = &source[..=tag_end];
+                let closing = source[delimiter.len()..].find(delimiter);
+                let end = closing.map_or(source.len(), |offset| delimiter.len() * 2 + offset);
+                let value = input.next_slice(end);
+                return Ok(Token {
+                    kind: if closing.is_some() {
+                        TokenKind::String
+                    } else {
+                        TokenKind::Unterminated
+                    },
+                    value,
+                    key: None,
+                    alias: value,
+                });
+            }
+        }
+    }
+    let parsed = dispatch! {any;
         '`' => (take_till_escaping('`', &['`']), any).void(),
         '[' if dialect == Dialect::SQLServer => (take_till_escaping(']', &[']']), any).void(),
         '"' => (take_till_escaping('"', &['"', '\\']), any).void(),
         '\'' => (take_till_escaping('\'', &['\'', '\\']), any).void(),
-        'N' => ('\'', take_till_escaping('\'', &['\'', '\\']), any).void(),
-        'E' => ('\'', take_till_escaping('\'', &['\'', '\\']), any).void(),
+        'N' | 'n' => ('\'', take_till_escaping('\'', &['\'', '\\']), any).void(),
+        'E' | 'e' => ('\'', take_till_escaping('\'', &['\'', '\\']), any).void(),
         'x' => ('\'', take_till_escaping('\'', &[]), any).void(),
         'X' => ('\'', take_till_escaping('\'', &[]), any).void(),
         _ => fail,
@@ -263,7 +318,24 @@ fn get_string_token<'i>(input: &mut &'i str, dialect: Dialect) -> Result<Token<'
         value: token,
         key: None,
         alias: token,
-    })
+    });
+    if parsed.is_err()
+        && (source.starts_with(['\'', '"', '`'])
+            || source.starts_with('[') && dialect == Dialect::SQLServer
+            || ["E'", "e'", "N'", "n'", "x'", "X'"]
+                .iter()
+                .any(|prefix| source.starts_with(prefix)))
+    {
+        *input = "";
+        Ok(Token {
+            kind: TokenKind::Unterminated,
+            value: source,
+            key: None,
+            alias: source,
+        })
+    } else {
+        parsed
+    }
 }
 
 // Like above but it doesn't replace double quotes
@@ -288,7 +360,7 @@ fn get_placeholder_string_token<'i>(input: &mut &'i str, dialect: Dialect) -> Re
 
 fn get_open_paren_token<'i>(input: &mut &'i str, dialect: Dialect) -> Result<Token<'i>> {
     let case = terminated(Caseless("CASE"), end_of_word);
-    let open_paren = if dialect == Dialect::PostgreSql {
+    let open_paren = if matches!(dialect, Dialect::PostgreSql | Dialect::DuckDb) {
         ("(", "[", case)
     } else {
         ("(", "(", case)
@@ -311,7 +383,7 @@ fn get_close_paren_token<'i>(input: &mut &'i str, dialect: Dialect) -> Result<To
     )
         .take();
     let end = terminated(Caseless("END"), end_of_word);
-    let close_paren = if dialect == Dialect::PostgreSql {
+    let close_paren = if matches!(dialect, Dialect::PostgreSql | Dialect::DuckDb) {
         (")", "]", end_case, end)
     } else {
         (")", ")", end_case, end)
@@ -646,12 +718,10 @@ fn get_top_level_reserved_token<'a>(
         };
 
         if let Ok(token) = result {
-            let token = finalize(input, token);
-
-            let kind = match (
-                token,
-                last_reserved_top_level_token.as_ref().map(|v| v.alias),
-            ) {
+            let previous = last_reserved_top_level_token
+                .as_ref()
+                .map(|v| v.alias.to_ascii_uppercase());
+            let kind = match (token, previous.as_deref()) {
                 ("EXCEPT", Some("SELECT")) =>
                 // If the query state doesn't allow EXCEPT, treat it as a reserved word
                 {
@@ -664,17 +734,18 @@ fn get_top_level_reserved_token<'a>(
                 _ => TokenKind::ReservedTopLevel,
             };
 
+            let value = finalize(input, token);
             let alias = if token.starts_with("CREATE") {
                 "CREATE"
             } else if token.starts_with("SELECT") {
                 "SELECT"
             } else {
-                token
+                value
             };
 
             Ok(Token {
                 kind,
-                value: token,
+                value,
                 key: None,
                 alias,
             })
@@ -806,9 +877,13 @@ fn get_newline_reserved_token<'a>(
 
         if let Ok(token) = result {
             let token = finalize(input, token);
-            let kind = if token == "AND"
+            let kind = if token.eq_ignore_ascii_case("AND")
                 && last_reserved_token.is_some()
-                && last_reserved_token.as_ref().unwrap().value == "BETWEEN"
+                && last_reserved_token
+                    .as_ref()
+                    .unwrap()
+                    .value
+                    .eq_ignore_ascii_case("BETWEEN")
             {
                 // If the "AND" is part of a "BETWEEN" clause, we want to handle it as one clause by not adding a new line.
                 TokenKind::Reserved

@@ -10,6 +10,41 @@ Format SQL strings into readable, consistently styled output. `sqlformat` is a p
 
 This crate is a Rust port of [sql-formatter-plus](https://github.com/kufii/sql-formatter-plus). There is currently no binary; the crate is intended to be used as a library.
 
+## DuckDB profile in the linstromcloud fork
+
+`FormatOptions::duckdb()` selects two-space indentation, a soft 100-column
+target, uppercase keywords and lowercase known built-in functions. It preserves
+identifier spelling, expands CTE bodies with blank lines between CTEs, separates
+JOINs and additional predicates, and keeps short queries and expressions inline.
+
+```rust
+use sqlformat::{format, FormatOptions, QueryParams};
+
+let sql = "select id, country from users where id = 1;";
+assert_eq!(
+    format(sql, &QueryParams::None, &FormatOptions::duckdb()),
+    "SELECT id, country FROM users WHERE id = 1;"
+);
+```
+
+Use this fork as a Git dependency and pin the reviewed commit when integrating:
+
+```toml
+sqlformat = { git = "https://github.com/linstromcloud/sqlformat-rs", branch = "codex/duckdb-formatting-50" }
+```
+
+`Dialect::DuckDb` selects DuckDB token classification independently of layout;
+`compact: true` selects compact layout. The checked-in built-in vocabulary comes
+from DuckDB v1.5.5. Qualified functions and unknown function names keep their
+spelling. Quoted strings and identifiers retain their contents; long literals
+may exceed the width target. Inputs with unfinished quotes/comments remain
+unchanged. Compact mode also preserves the complete input when it contains
+`-- fmt: off` or `-- fmt: on` controls.
+
+Dollar-quoted literals, including PostgreSQL function bodies, retain their exact
+contents. Inline formatting keeps the newlines that terminate line comments.
+These correctness fixes also apply with the original formatting defaults.
+
 ## Key features
 
 - **Broad SQL support**: Common constructs from PostgreSQL, MySQL/MariaDB, SQLite, SQL Server, and Oracle (DDL, DML, CTEs, CASE, JOINs, window functions, operators, type casts, etc.).
@@ -59,7 +94,7 @@ Or manually in `Cargo.toml`:
 sqlformat = "*"
 ```
 
-Minimum Supported Rust Version (MSRV): `1.84`.
+Minimum Supported Rust Version (MSRV): `1.86`.
 
 ## Usage examples
 
@@ -114,7 +149,7 @@ Control how aggressively short blocks and argument lists are kept on one line.
 use sqlformat::{format, FormatOptions, QueryParams};
 
 let options = FormatOptions {
-    inline: false,              // when true, forces single-line output
+    inline: false,              // when true, inlines layout except line-comment boundaries
     max_inline_block: 50,       // characters allowed to keep a parenthesized block inline
     max_inline_arguments: Some(40),
     max_inline_top_level: Some(40),

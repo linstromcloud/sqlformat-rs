@@ -9,6 +9,8 @@
 // This lint is overly pedantic and annoying
 #![allow(clippy::needless_lifetimes)]
 
+mod duckdb;
+mod duckdb_words;
 mod formatter;
 mod indentation;
 mod inline_block;
@@ -23,7 +25,75 @@ mod debug;
 pub fn format(query: &str, params: &QueryParams, options: &FormatOptions) -> String {
     let named_placeholders = matches!(params, QueryParams::Named(_));
 
-    let tokens = tokenizer::tokenize(query, named_placeholders, options);
+    let mut tokens = tokenizer::tokenize(query, named_placeholders, options);
+    if tokens
+        .iter()
+        .any(|token| token.kind == tokenizer::TokenKind::Unterminated)
+        || (options.compact
+            && tokens.iter().any(|token| {
+                matches!(
+                    token.kind,
+                    tokenizer::TokenKind::LineComment | tokenizer::TokenKind::BlockComment
+                ) && formatter::check_fmt_off(token.value).is_some()
+            }))
+    {
+        return query.to_string();
+    }
+    if options.dialect == Dialect::DuckDb {
+        duckdb::classify(&mut tokens);
+    }
+    if options.compact {
+        // Layout estimates use canonical spacing, so input whitespace cannot
+        // change a wrapping decision on a subsequent format.
+        let mut canonical = Vec::with_capacity(tokens.len());
+        let mut line_break = false;
+        for token in tokens {
+            if token.kind == tokenizer::TokenKind::Whitespace {
+                line_break = token.value.contains('\n');
+                continue;
+            }
+            if !canonical.is_empty() {
+                let value = if line_break && token.kind == tokenizer::TokenKind::LineComment {
+                    "\n"
+                } else {
+                    " "
+                };
+                canonical.push(tokenizer::Token {
+                    kind: tokenizer::TokenKind::Whitespace,
+                    value,
+                    alias: value,
+                    key: None,
+                });
+            }
+            canonical.push(token);
+            line_break = false;
+        }
+        tokens = canonical;
+    }
+    if options.compact
+        && !options.inline
+        && tokens.iter().all(|token| {
+            !matches!(
+                token.kind,
+                tokenizer::TokenKind::LineComment | tokenizer::TokenKind::BlockComment
+            ) && !token.value.eq_ignore_ascii_case("with")
+                && !token.value.to_ascii_uppercase().ends_with("JOIN")
+        })
+    {
+        let inline = formatter::format(
+            &tokens,
+            params,
+            &FormatOptions {
+                inline: true,
+                ..options.clone()
+            },
+        );
+        if !inline.contains('\n')
+            && inline.chars().count() <= options.max_inline_top_level.unwrap_or(100)
+        {
+            return inline;
+        }
+    }
     formatter::format(&tokens, params, options)
 }
 
@@ -34,6 +104,8 @@ pub enum Dialect {
     Generic,
     /// Enables array syntax (`[`, `]`) and operators
     PostgreSql,
+    /// DuckDB arrays, keywords and identifier casing.
+    DuckDb,
     /// Enables `[bracketed identifiers]` and `@variables`
     SQLServer,
 }
@@ -41,6 +113,10 @@ pub enum Dialect {
 /// Options for controlling how the library formats SQL
 #[derive(Debug, Clone)]
 pub struct FormatOptions<'a> {
+    /// Compact clause layout with expanded CTEs and separate predicates.
+    /// Short statements fit on one line up to `max_inline_top_level`.
+    /// Default: false.
+    pub compact: bool,
     /// Controls the type and length of indentation to use
     ///
     /// Default: 2 spaces
@@ -88,6 +164,7 @@ pub struct FormatOptions<'a> {
 impl<'a> Default for FormatOptions<'a> {
     fn default() -> Self {
         FormatOptions {
+            compact: false,
             indent: Indent::Spaces(2),
             uppercase: None,
             lines_between_queries: 1,
@@ -98,6 +175,23 @@ impl<'a> Default for FormatOptions<'a> {
             max_inline_top_level: None,
             joins_as_top_level: false,
             dialect: Dialect::Generic,
+        }
+    }
+}
+
+impl FormatOptions<'_> {
+    /// DuckDB's compact style: two spaces, a soft 100-column target,
+    /// uppercase keywords, lowercase built-in functions and preserved identifiers.
+    pub fn duckdb() -> Self {
+        Self {
+            compact: true,
+            uppercase: Some(true),
+            max_inline_block: 100,
+            max_inline_arguments: Some(100),
+            max_inline_top_level: Some(100),
+            joins_as_top_level: true,
+            dialect: Dialect::DuckDb,
+            ..Self::default()
         }
     }
 }
@@ -1093,21 +1187,14 @@ mod tests {
     }
 
     #[test]
-    fn it_formats_query_that_ends_with_open_comment() {
+    fn it_preserves_query_that_ends_with_open_comment() {
         let input = indoc!(
             "
             SELECT count(*)
             /*Comment"
         );
         let options = FormatOptions::default();
-        let expected = indoc!(
-            "
-            SELECT
-              count(*)
-              /*Comment"
-        );
-
-        assert_eq!(format(input, &QueryParams::None, &options), expected);
+        assert_eq!(format(input, &QueryParams::None, &options), input);
     }
 
     #[test]
@@ -2230,19 +2317,8 @@ mod tests {
     fn it_keeps_double_dollar_signs_together() {
         let input = "CREATE FUNCTION abc() AS $$ SELECT * FROM table $$ LANGUAGE plpgsql;";
         let options = FormatOptions::default();
-        let expected = indoc!(
-            "
-            CREATE FUNCTION abc() AS
-            $$
-            SELECT
-              *
-            FROM
-              table
-            $$
-            LANGUAGE plpgsql;"
-        );
-
-        assert_eq!(format(input, &QueryParams::None, &options), expected);
+        // Function bodies are dollar-quoted literals, not outer SQL tokens.
+        assert_eq!(format(input, &QueryParams::None, &options), input);
     }
 
     #[test]
@@ -2262,26 +2338,10 @@ mod tests {
     }
 
     #[test]
-    fn it_formats_pgplsql() {
+    fn it_preserves_pgplsql_function_bodies() {
         let input = "CREATE FUNCTION abc() AS $$ DECLARE a int := 1; b int := 2; BEGIN SELECT * FROM table $$ LANGUAGE plpgsql;";
         let options = FormatOptions::default();
-        let expected = indoc!(
-            "
-            CREATE FUNCTION abc() AS
-            $$
-            DECLARE
-            a int := 1;
-            b int := 2;
-            BEGIN
-            SELECT
-              *
-            FROM
-              table
-            $$
-            LANGUAGE plpgsql;"
-        );
-
-        assert_eq!(format(input, &QueryParams::None, &options), expected);
+        assert_eq!(format(input, &QueryParams::None, &options), input);
     }
 
     #[test]

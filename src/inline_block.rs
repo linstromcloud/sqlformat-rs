@@ -44,9 +44,9 @@ impl InlineBlock {
             && (!info.has_reseved_tokens || info.length <= self.reserved_limit)
     }
 
-    pub fn begin_if_possible(&mut self, tokens: &[Token<'_>], index: usize) -> bool {
+    pub fn begin_if_possible(&mut self, tokens: &[Token<'_>], index: usize, allow: bool) -> bool {
         let info = self.build_info(tokens, index);
-        if self.level == 0 && self.is_inline_block(&info) {
+        if self.level == 0 && allow && self.is_inline_block(&info) {
             self.level = 1;
         } else if self.level > 0 {
             self.level += 1;
