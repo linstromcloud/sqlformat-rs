@@ -190,6 +190,7 @@ struct Formatter<'a> {
     indentation: Indentation<'a>,
     inline_block: InlineBlock,
     block_level: usize,
+    predicate_indent: bool,
 }
 
 impl<'a> Formatter<'a> {
@@ -206,10 +207,12 @@ impl<'a> Formatter<'a> {
                 options.max_inline_top_level.unwrap_or(0),
             ),
             block_level: 0,
+            predicate_indent: false,
         }
     }
 
     fn set_top_level_span(&mut self, token: &'a Token<'a>, span_info: SpanInfo) {
+        self.predicate_indent = false;
         self.indentation.set_previous_top_level(token, span_info);
     }
 
@@ -235,7 +238,12 @@ impl<'a> Formatter<'a> {
             }
         }
         query.push_str(token.value);
-        self.add_new_line(query);
+        // A line comment ends at a real newline, including in inline mode.
+        self.trim_spaces_end(query);
+        query.push('\n');
+        if !self.options.inline {
+            query.push_str(&self.indentation.get_indent(false));
+        }
     }
 
     fn format_type_specifier(&self, token: &Token<'_>, query: &mut String) {
@@ -255,7 +263,11 @@ impl<'a> Formatter<'a> {
     }
     fn format_block_comment(&mut self, token: &Token<'_>, query: &mut String) {
         self.add_new_line(query);
-        query.push_str(&self.indent_comment(token.value));
+        if self.options.dialect == crate::Dialect::DuckDb || token.value[2..].contains("/*") {
+            query.push_str(token.value);
+        } else {
+            query.push_str(&self.indent_comment(token.value));
+        }
         self.add_new_line(query);
     }
 
@@ -339,7 +351,11 @@ impl<'a> Formatter<'a> {
             .previous_non_whitespace_token(1)
             .is_some_and(|t| t.kind == TokenKind::LineComment);
 
+        let separate_predicate = self.options.compact
+            && matches!(token.value.to_ascii_uppercase().as_str(), "AND" | "OR")
+            && !self.inline_block.is_active();
         if after_line_comment
+            || separate_predicate
             || !self.inline_block.is_active()
                 && self
                     .options
@@ -348,8 +364,9 @@ impl<'a> Formatter<'a> {
         {
             // We inlined something to the top level let's increase the indentation now
             if let Some((_, s)) = self.indentation.previous_top_level_reserved() {
-                if !s.newline_after {
+                if !s.newline_after && !self.predicate_indent {
                     self.indentation.increase_top_level(s.clone());
+                    self.predicate_indent = true;
                 }
             }
 
@@ -368,7 +385,10 @@ impl<'a> Formatter<'a> {
     }
 
     fn format_with_spaces(&self, token: &Token<'_>, query: &mut String) {
-        if token.kind == TokenKind::Reserved {
+        if token.kind == TokenKind::Function && self.options.compact {
+            query.push_str(&token.value.to_ascii_lowercase());
+            query.push(' ');
+        } else if token.kind == TokenKind::Reserved {
             let value = self.equalize_whitespace(&self.format_reserved_word(token.value));
             query.push_str(&value);
             query.push(' ');
@@ -390,7 +410,19 @@ impl<'a> Formatter<'a> {
         const ADD_WHITESPACE_BETWEEN: &[TokenKind] = &[TokenKind::CloseParen, TokenKind::Reserved];
         const BEFORE_ARRAY: &[TokenKind] =
             &[TokenKind::CloseParen, TokenKind::Word, TokenKind::Reserved];
-        let inlined = self.inline_block.begin_if_possible(self.tokens, self.index);
+        let cte_body = self.options.compact
+            && self.previous_non_whitespace_token(1).is_some_and(|t| {
+                t.value.eq_ignore_ascii_case("AS") || t.value.eq_ignore_ascii_case("MATERIALIZED")
+            })
+            && self.next_non_whitespace_token(1).is_some_and(|t| {
+                matches!(
+                    t.value.to_ascii_uppercase().as_str(),
+                    "SELECT" | "SELECT DISTINCT" | "WITH" | "FROM" | "VALUES"
+                )
+            });
+        let inlined = self
+            .inline_block
+            .begin_if_possible(self.tokens, self.index, !cte_body);
         let previous_non_whitespace_token = self.previous_non_whitespace_token(1);
         let fold_in_top_level = !inlined
             && self.options.max_inline_top_level.is_some()
@@ -408,7 +440,10 @@ impl<'a> Formatter<'a> {
         // Take out the preceding space unless there was whitespace there in the original query
         // or another opening parens or line comment
         let previous_token = self.previous_token(1);
-        if previous_token.is_none_or(|t| !PRESERVE_WHITESPACE_FOR.contains(&t.kind))
+        if (self.options.compact
+            && previous_non_whitespace_token
+                .is_some_and(|t| matches!(t.kind, TokenKind::Word | TokenKind::Function)))
+            || previous_token.is_none_or(|t| !PRESERVE_WHITESPACE_FOR.contains(&t.kind))
             || previous_non_whitespace_token
                 .is_some_and(|t| token.value == "[" && BEFORE_ARRAY.contains(&t.kind))
         {
@@ -417,6 +452,11 @@ impl<'a> Formatter<'a> {
 
         if previous_non_whitespace_token
             .is_some_and(|t| token.value != "[" && ADD_WHITESPACE_BETWEEN.contains(&t.kind))
+            || (self.options.compact
+                && token.value == "["
+                && previous_non_whitespace_token.is_some_and(|t| {
+                    matches!(t.kind, TokenKind::Reserved | TokenKind::ReservedTopLevel)
+                }))
         {
             self.trim_spaces_end(query);
             query.push(' ');
@@ -517,6 +557,18 @@ impl<'a> Formatter<'a> {
         if self.inline_block.is_active() {
             return;
         }
+        if self.options.compact
+            && self
+                .indentation
+                .previous_top_level_reserved()
+                .is_some_and(|(token, _)| token.value.eq_ignore_ascii_case("WITH"))
+        {
+            self.add_new_line(query);
+            self.trim_spaces_end(query);
+            query.push('\n');
+            query.push_str(&self.indentation.get_indent(false));
+            return;
+        }
         if self
             .indentation
             .previous_reserved()
@@ -528,7 +580,7 @@ impl<'a> Formatter<'a> {
 
         if let Some((_, span)) = self.indentation.previous_top_level_reserved() {
             let limit = self.options.max_inline_arguments.unwrap_or(0);
-            if limit >= span.full_span {
+            if limit >= span.full_span && !(self.options.compact && span.newline_after) {
                 return;
             }
         }
@@ -559,7 +611,9 @@ impl<'a> Formatter<'a> {
     fn add_new_line_inner(&self, query: &mut String, folded: bool) {
         self.trim_spaces_end(query);
         if self.options.inline {
-            query.push(' ');
+            if !query.ends_with('\n') {
+                query.push(' ');
+            }
             return;
         }
         if !query.ends_with('\n') {
@@ -685,6 +739,13 @@ impl<'a> Formatter<'a> {
         let mut arguments = 0;
 
         for token in self.tokens[self.index..].iter().skip(1) {
+            if self.options.compact
+                && block_level == self.block_level
+                && token.kind == TokenKind::ReservedNewline
+                && matches!(token.value.to_ascii_uppercase().as_str(), "AND" | "OR")
+            {
+                break;
+            }
             match token.kind {
                 TokenKind::OpenParen => {
                     if block_level == self.block_level {
@@ -730,7 +791,18 @@ impl<'a> Formatter<'a> {
             full_span += token.value.len();
         }
 
-        let limit = self.options.max_inline_top_level.unwrap_or(0);
+        let prefix = if self.options.compact {
+            self.tokens[self.index].value.chars().count()
+                + 1
+                + self.indentation.get_indent(false).len()
+        } else {
+            0
+        };
+        let limit = self
+            .options
+            .max_inline_top_level
+            .unwrap_or(0)
+            .saturating_sub(prefix);
         // if we are inside an inline block we decide our behaviour as if were inline
         let block_len = self.inline_block.cur_len();
 
@@ -739,11 +811,14 @@ impl<'a> Formatter<'a> {
         // if we are going to format a list of arguments take in account also the limit for
         // arguments
         let arguments_limit = self.options.max_inline_arguments.unwrap_or(0);
-        let newline_after = if arguments > 1 && arguments_limit != 0 {
-            arguments_limit.min(limit) < full_span
-        } else {
-            limit < full_span
-        };
+        let newline_after =
+            if self.options.compact && self.tokens[self.index].value.eq_ignore_ascii_case("WITH") {
+                false
+            } else if arguments > 1 && arguments_limit != 0 {
+                arguments_limit.min(limit) < full_span
+            } else {
+                limit < full_span
+            };
 
         SpanInfo {
             full_span,
